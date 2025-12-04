@@ -9,41 +9,53 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("BSU CS 452 HW5");
 MODULE_AUTHOR("<buff@cs.boisestate.edu>");
-
 // One per driver (GLOBAL)
 typedef struct
 {
   dev_t devno;      // Device number assigned by kernel
-  struct cdev cdev; // Character device Structure
-  char *s;          // Global string ( Default separators)
-} Device;           /* per-init() data */
+  struct cdev cdev; // Character device structure
+  char *s;          // Global string (Default separators)
+  size_t s_len;     // Length of default separators
+} Device;
 
-// One per open() ( PER INSTANCE )
-// Add fields for seperators, data, position, mode flag
+// One per open() (PER INSTANCE)
 typedef struct
 {
-  char *separators;
-  size_t sep_len;
-  char *data;
-  size_t data_len;
-  size_t current_pos;
-  int next_write_is_sep;
+  char *separators;      // Separator characters
+  size_t sep_len;        // Number of separator characters
+  char *data;            // Data to scan
+  size_t data_len;       // Length of data
+  size_t current_pos;    // Current position in data
+  size_t token_end;      // End position of current token
+  int in_token;          // Flag: currently reading a token
+  int next_write_is_sep; // Flag: next write sets separators
 } File;
 
 static Device device;
 
-// TODO init new FILE fields copy default separators
+// Helper: check if character is a separator
+static int is_sep(File *file, char c)
+{
+  size_t i;
+  for (i = 0; i < file->sep_len; i++)
+  {
+    if (c == file->separators[i])
+      return 1;
+  }
+  return 0;
+}
+
 static int open(struct inode *inode, struct file *filp)
 {
-  // 1. Allocate memory for instance data
   File *file = (File *)kmalloc(sizeof(*file), GFP_KERNEL);
   if (!file)
   {
     printk(KERN_ERR "%s: kmalloc() failed\n", DEVNAME);
     return -ENOMEM;
   }
+
   // Copy default separators
-  file->sep_len = strlen(device.s);
+  file->sep_len = device.s_len;
   file->separators = (char *)kmalloc(file->sep_len, GFP_KERNEL);
   if (!file->separators)
   {
@@ -51,35 +63,19 @@ static int open(struct inode *inode, struct file *filp)
     return -ENOMEM;
   }
   memcpy(file->separators, device.s, file->sep_len);
+
   // Initialize other fields
   file->data = NULL;
   file->data_len = 0;
   file->current_pos = 0;
+  file->token_end = 0;
+  file->in_token = 0;
   file->next_write_is_sep = 0;
 
   filp->private_data = file;
   return 0;
-
-  // // 2. Allocate memory for this instance's string copy
-  // file->s = (char *)kmalloc(strlen(device.s) + 1, GFP_KERNEL);
-  // if (!file->s)
-  // {
-  //   printk(KERN_ERR "%s: kmalloc() failed\n", DEVNAME);
-
-  //   // Clean up first allocation
-  //   kfree(file);
-  //   return -ENOMEM;
-  // }
-  // // 3. Copy the global string to this instance
-  // strcpy(file->s, device.s);
-  // // 4. Store intance data where other functions can find it
-  // filp->private_data = file;
-
-  // // SUCCESS
-  // return 0;
 }
 
-// TODO Free any new fields added
 static int release(struct inode *inode, struct file *filp)
 {
   File *file = filp->private_data;
@@ -90,28 +86,7 @@ static int release(struct inode *inode, struct file *filp)
   kfree(file);
   return 0;
 }
-// TODO Complete rewrite (Implement token scanning logic)
-static ssize_t read(struct file *filp,
-                    char *buf,
-                    size_t count,
-                    loff_t *f_pos)
-{
-  File *file = filp->private_data;
-  // How many bytes to copy
-  int n = strlen(file->s);
-  n = (n < count ? n : count);
 
-  // Copy from kernel space to user space
-  if (copy_to_user(buf, file->s, n))
-  {
-    printk(KERN_ERR "%s: copy_to_user() failed\n", DEVNAME);
-    return 0;
-  }
-
-  // Return number of bytes copied
-  return n;
-}
-// TODO set next write is separators flag
 static long ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
   File *file = filp->private_data;
@@ -149,7 +124,7 @@ static ssize_t write(struct file *filp, const char *buf, size_t count, loff_t *f
   }
   else
   {
-    // Writing data to scan
+    // Writing data to scan - each write is a NEW sequence
     temp = (char *)kmalloc(count, GFP_KERNEL);
     if (!temp)
       return -ENOMEM;
@@ -164,82 +139,63 @@ static ssize_t write(struct file *filp, const char *buf, size_t count, loff_t *f
       kfree(file->data);
     file->data = temp;
     file->data_len = count;
-    file->current_pos = 0; // Reset to start
+    file->current_pos = 0;
+    file->token_end = 0;
+    file->in_token = 0;
   }
 
   return count;
 }
 
-static struct file_operations ops = {
-    .open = open,
-    .release = release,
-    .read = read,
-    .write = write,
-    .unlocked_ioctl = ioctl,
-    .owner = THIS_MODULE};
-
+/*
+ * read() - Return next token (or portion of token)
+ *
+ * Returns:
+ *   > 0  : Number of bytes of token copied
+ *   0    : End of current token (call again for next token)
+ *   -1   : End of data (no more tokens)
+ */
 static ssize_t read(struct file *filp, char *buf, size_t count, loff_t *f_pos)
 {
   File *file = filp->private_data;
-  size_t i, token_start, token_end, bytes_to_copy;
-  int is_separator;
+  size_t bytes_to_copy;
 
   // No data to scan
   if (!file->data || file->data_len == 0)
     return -1;
 
-  // Already at end of data
-  if (file->current_pos >= file->data_len)
-    return -1;
-
-  // Skip leading separators to find start of token
-  while (file->current_pos < file->data_len)
+  // If not currently in a token, find the next one
+  if (!file->in_token)
   {
-    is_separator = 0;
-    for (i = 0; i < file->sep_len; i++)
+    // Skip leading separators
+    while (file->current_pos < file->data_len && is_sep(file, file->data[file->current_pos]))
     {
-      if (file->data[file->current_pos] == file->separators[i])
-      {
-        is_separator = 1;
-        break;
-      }
+      file->current_pos++;
     }
-    if (!is_separator)
-      break; // Found start of token
-    file->current_pos++;
+
+    // If we've reached the end, no more tokens
+    if (file->current_pos >= file->data_len)
+      return -1;
+
+    // Find the end of this token
+    file->token_end = file->current_pos;
+    while (file->token_end < file->data_len && !is_sep(file, file->data[file->token_end]))
+    {
+      file->token_end++;
+    }
+
+    file->in_token = 1;
   }
 
-  // If we skipped to the end, no more tokens
-  if (file->current_pos >= file->data_len)
-    return -1;
+  // We're in a token - return as much as we can
+  bytes_to_copy = file->token_end - file->current_pos;
 
-  // Now we're at the start of a token
-  token_start = file->current_pos;
-
-  // Find the end of the token (next separator or end of data)
-  token_end = token_start;
-  while (token_end < file->data_len)
-  {
-    is_separator = 0;
-    for (i = 0; i < file->sep_len; i++)
-    {
-      if (file->data[token_end] == file->separators[i])
-      {
-        is_separator = 1;
-        break;
-      }
-    }
-    if (is_separator)
-      break; // Found end of token
-    token_end++;
-  }
-
-  // Calculate how much of the token to return
-  bytes_to_copy = token_end - file->current_pos;
-
-  // If we're at the end of the token, return 0
   if (bytes_to_copy == 0)
+  {
+    // We've returned the entire token, signal end of token
+    file->in_token = 0;
     return 0;
+  }
 
   if (bytes_to_copy > count)
     bytes_to_copy = count;
@@ -255,40 +211,54 @@ static ssize_t read(struct file *filp, char *buf, size_t count, loff_t *f_pos)
 
   return bytes_to_copy;
 }
-// TODO Init default separators instead of "Hello world!"
+
+static struct file_operations ops = {
+    .open = open,
+    .release = release,
+    .read = read,
+    .write = write,
+    .unlocked_ioctl = ioctl,
+    .owner = THIS_MODULE};
+
 static int __init my_init(void)
 {
   const char *s = " \t\n"; // Default separators: space, tab, newline
   int err;
-  // 1. Allocating and copy default string
-  device.s = (char *)kmalloc(strlen(s) + 1, GFP_KERNEL);
+
+  // Allocate and copy default separators (NOT null-terminated)
+  device.s_len = 3; // space, tab, newline
+  device.s = (char *)kmalloc(device.s_len, GFP_KERNEL);
   if (!device.s)
   {
     printk(KERN_ERR "%s: kmalloc() failed\n", DEVNAME);
     return -ENOMEM;
   }
-  strcpy(device.s, s);
+  memcpy(device.s, s, device.s_len);
 
-  // 2. Get a device number from the kernel
+  // Get a device number from the kernel
   err = alloc_chrdev_region(&device.devno, 0, 1, DEVNAME);
   if (err < 0)
   {
     printk(KERN_ERR "%s: alloc_chrdev_region() failed\n", DEVNAME);
+    kfree(device.s);
     return err;
   }
 
-  // 3. Initialize the character device with out operations
+  // Initialize the character device with our operations
   cdev_init(&device.cdev, &ops);
   device.cdev.owner = THIS_MODULE;
 
-  // 4. Add the device to the system
+  // Add the device to the system
   err = cdev_add(&device.cdev, device.devno, 1);
   if (err)
   {
     printk(KERN_ERR "%s: cdev_add() failed\n", DEVNAME);
+    unregister_chrdev_region(device.devno, 1);
+    kfree(device.s);
     return err;
   }
-  printk(KERN_INFO "%s: init\n", DEVNAME);
+
+  printk(KERN_INFO "%s: init (major=%d)\n", DEVNAME, MAJOR(device.devno));
   return 0;
 }
 
