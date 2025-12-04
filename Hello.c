@@ -19,11 +19,16 @@ typedef struct
 } Device;           /* per-init() data */
 
 // One per open() ( PER INSTANCE )
-// TODO Add fields for seperators, data, position, mode flag
+// Add fields for seperators, data, position, mode flag
 typedef struct
 {
-  char *s; // Copy of the string for this instance
-} File;    /* per-open() data */
+  char *separators;
+  size_t sep_len;
+  char *data;
+  size_t data_len;
+  size_t current_pos;
+  int next_write_is_sep;
+} File;
 
 static Device device;
 
@@ -37,34 +42,51 @@ static int open(struct inode *inode, struct file *filp)
     printk(KERN_ERR "%s: kmalloc() failed\n", DEVNAME);
     return -ENOMEM;
   }
-  // 2. Allocate memory for this instance's string copy
-  file->s = (char *)kmalloc(strlen(device.s) + 1, GFP_KERNEL);
-  if (!file->s)
+  // Copy default separators
+  file->sep_len = strlen(device.s);
+  file->separators = (char *)kmalloc(file->sep_len, GFP_KERNEL);
+  if (!file->separators)
   {
-    printk(KERN_ERR "%s: kmalloc() failed\n", DEVNAME);
-
-    // Clean up first allocation
     kfree(file);
     return -ENOMEM;
   }
-  // 3. Copy the global string to this instance
-  strcpy(file->s, device.s);
-  // 4. Store intance data where other functions can find it
-  filp->private_data = file;
+  memcpy(file->separators, device.s, file->sep_len);
+  // Initialize other fields
+  file->data = NULL;
+  file->data_len = 0;
+  file->current_pos = 0;
+  file->next_write_is_sep = 0;
 
-  // SUCCESS
+  filp->private_data = file;
   return 0;
+
+  // // 2. Allocate memory for this instance's string copy
+  // file->s = (char *)kmalloc(strlen(device.s) + 1, GFP_KERNEL);
+  // if (!file->s)
+  // {
+  //   printk(KERN_ERR "%s: kmalloc() failed\n", DEVNAME);
+
+  //   // Clean up first allocation
+  //   kfree(file);
+  //   return -ENOMEM;
+  // }
+  // // 3. Copy the global string to this instance
+  // strcpy(file->s, device.s);
+  // // 4. Store intance data where other functions can find it
+  // filp->private_data = file;
+
+  // // SUCCESS
+  // return 0;
 }
 
 // TODO Free any new fields added
 static int release(struct inode *inode, struct file *filp)
 {
-  // Get intance data
   File *file = filp->private_data;
-  // Free String
-  kfree(file->s);
-
-  // Free struct
+  if (file->separators)
+    kfree(file->separators);
+  if (file->data)
+    kfree(file->data);
   kfree(file);
   return 0;
 }
@@ -90,11 +112,62 @@ static ssize_t read(struct file *filp,
   return n;
 }
 // TODO set next write is separators flag
-static long ioctl(struct file *filp,
-                  unsigned int cmd,
-                  unsigned long arg)
+static long ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-  return 0;
+  File *file = filp->private_data;
+  if (cmd == 0)
+  {
+    file->next_write_is_sep = 1;
+    return 0;
+  }
+  return -EINVAL;
+}
+
+static ssize_t write(struct file *filp, const char *buf, size_t count, loff_t *f_pos)
+{
+  File *file = filp->private_data;
+  char *temp;
+
+  if (file->next_write_is_sep)
+  {
+    // Writing separators
+    temp = (char *)kmalloc(count, GFP_KERNEL);
+    if (!temp)
+      return -ENOMEM;
+
+    if (copy_from_user(temp, buf, count))
+    {
+      kfree(temp);
+      return -EFAULT;
+    }
+
+    if (file->separators)
+      kfree(file->separators);
+    file->separators = temp;
+    file->sep_len = count;
+    file->next_write_is_sep = 0;
+  }
+  else
+  {
+    // Writing data to scan
+    temp = (char *)kmalloc(count, GFP_KERNEL);
+    if (!temp)
+      return -ENOMEM;
+
+    if (copy_from_user(temp, buf, count))
+    {
+      kfree(temp);
+      return -EFAULT;
+    }
+
+    if (file->data)
+      kfree(file->data);
+    file->data = temp;
+    file->data_len = count;
+    file->current_pos = 0; // Reset to start
+  }
+
+  return count;
 }
 
 static struct file_operations ops = {
@@ -105,10 +178,87 @@ static struct file_operations ops = {
     .unlocked_ioctl = ioctl,
     .owner = THIS_MODULE};
 
+static ssize_t read(struct file *filp, char *buf, size_t count, loff_t *f_pos)
+{
+  File *file = filp->private_data;
+  size_t i, token_start, token_end, bytes_to_copy;
+  int is_separator;
+
+  // No data to scan
+  if (!file->data || file->data_len == 0)
+    return -1;
+
+  // Already at end of data
+  if (file->current_pos >= file->data_len)
+    return -1;
+
+  // Skip leading separators to find start of token
+  while (file->current_pos < file->data_len)
+  {
+    is_separator = 0;
+    for (i = 0; i < file->sep_len; i++)
+    {
+      if (file->data[file->current_pos] == file->separators[i])
+      {
+        is_separator = 1;
+        break;
+      }
+    }
+    if (!is_separator)
+      break; // Found start of token
+    file->current_pos++;
+  }
+
+  // If we skipped to the end, no more tokens
+  if (file->current_pos >= file->data_len)
+    return -1;
+
+  // Now we're at the start of a token
+  token_start = file->current_pos;
+
+  // Find the end of the token (next separator or end of data)
+  token_end = token_start;
+  while (token_end < file->data_len)
+  {
+    is_separator = 0;
+    for (i = 0; i < file->sep_len; i++)
+    {
+      if (file->data[token_end] == file->separators[i])
+      {
+        is_separator = 1;
+        break;
+      }
+    }
+    if (is_separator)
+      break; // Found end of token
+    token_end++;
+  }
+
+  // Calculate how much of the token to return
+  bytes_to_copy = token_end - file->current_pos;
+
+  // If we're at the end of the token, return 0
+  if (bytes_to_copy == 0)
+    return 0;
+
+  if (bytes_to_copy > count)
+    bytes_to_copy = count;
+
+  // Copy to user space
+  if (copy_to_user(buf, &file->data[file->current_pos], bytes_to_copy))
+  {
+    printk(KERN_ERR "%s: copy_to_user() failed\n", DEVNAME);
+    return -EFAULT;
+  }
+
+  file->current_pos += bytes_to_copy;
+
+  return bytes_to_copy;
+}
 // TODO Init default separators instead of "Hello world!"
 static int __init my_init(void)
 {
-  const char *s = "Hello world!\n";
+  const char *s = " \t\n"; // Default separators: space, tab, newline
   int err;
   // 1. Allocating and copy default string
   device.s = (char *)kmalloc(strlen(s) + 1, GFP_KERNEL);
